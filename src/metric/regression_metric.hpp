@@ -7,6 +7,7 @@
 #define LIGHTGBM_SRC_METRIC_REGRESSION_METRIC_HPP_
 
 #include <LightGBM/metric.h>
+#include <LightGBM/network.h>
 #include <LightGBM/utils/log.h>
 
 #include <string>
@@ -91,7 +92,13 @@ class RegressionMetric: public Metric {
         }
       }
     }
-    double loss = PointWiseLossCalculator::AverageLoss(sum_loss, sum_weights_);
+    double global_sum_loss = sum_loss;
+    double global_sum_weights = sum_weights_;
+    if (Network::num_machines() > 1) {
+      global_sum_loss = Network::GlobalSyncUpBySum(global_sum_loss);
+      global_sum_weights = Network::GlobalSyncUpBySum(global_sum_weights);
+    }
+    double loss = PointWiseLossCalculator::AverageLoss(global_sum_loss, global_sum_weights);
     return std::vector<double>(1, loss);
   }
 
@@ -352,6 +359,10 @@ class R2Metric: public Metric {
       }
       sum_weights_ = local_sum_weights;
     }
+    if (Network::num_machines() > 1) {
+      sum_label = Network::GlobalSyncUpBySum(sum_label);
+      sum_weights_ = Network::GlobalSyncUpBySum(sum_weights_);
+    }
     label_mean_ = sum_label / sum_weights_;
 
     total_sum_squares_ = 0.0f;
@@ -368,6 +379,9 @@ class R2Metric: public Metric {
         double diff = label_[i] - label_mean_;
         local_total_sum_squares += diff * diff * weights_[i];
       }
+    }
+    if (Network::num_machines() > 1) {
+      local_total_sum_squares = Network::GlobalSyncUpBySum(local_total_sum_squares);
     }
     total_sum_squares_ = local_total_sum_squares;
   }
@@ -408,6 +422,9 @@ class R2Metric: public Metric {
       }
     }
 
+    if (Network::num_machines() > 1) {
+      residual_sum_squares = Network::GlobalSyncUpBySum(residual_sum_squares);
+    }
     double r2 = 1.0 - (residual_sum_squares / total_sum_squares_);
     if (std::fabs(total_sum_squares_) < kZeroThreshold) {
       return std::vector<double>(1, std::fabs(residual_sum_squares) < kZeroThreshold ? 1.0 : 0.0);

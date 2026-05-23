@@ -8,6 +8,7 @@
 
 #include <LightGBM/meta.h>
 #include <LightGBM/metric.h>
+#include <LightGBM/network.h>
 #include <LightGBM/utils/common.h>
 #include <LightGBM/utils/log.h>
 
@@ -135,7 +136,13 @@ class CrossEntropyMetric : public Metric {
         }
       }
     }
-    double loss = sum_loss / sum_weights_;
+    double global_sum_loss = sum_loss;
+    double global_sum_weights = sum_weights_;
+    if (Network::num_machines() > 1) {
+      global_sum_loss = Network::GlobalSyncUpBySum(global_sum_loss);
+      global_sum_weights = Network::GlobalSyncUpBySum(global_sum_weights);
+    }
+    double loss = global_sum_loss / global_sum_weights;
     return std::vector<double>(1, loss);
   }
 
@@ -222,7 +229,13 @@ class CrossEntropyLambdaMetric : public Metric {
         }
       }
     }
-    return std::vector<double>(1, sum_loss / static_cast<double>(num_data_));
+    double global_sum_loss = sum_loss;
+    double global_num_data = static_cast<double>(num_data_);
+    if (Network::num_machines() > 1) {
+      global_sum_loss = Network::GlobalSyncUpBySum(global_sum_loss);
+      global_num_data = Network::GlobalSyncUpBySum(global_num_data);
+    }
+    return std::vector<double>(1, global_sum_loss / global_num_data);
   }
 
   const std::vector<std::string>& GetName() const override {
@@ -290,6 +303,10 @@ class KullbackLeiblerDivergence : public Metric {
         presum_label_entropy_ += YentLoss(label_[i]) * weights_[i];
       }
     }
+    if (Network::num_machines() > 1) {
+      presum_label_entropy_ = Network::GlobalSyncUpBySum(presum_label_entropy_);
+      sum_weights_ = Network::GlobalSyncUpBySum(sum_weights_);
+    }
     presum_label_entropy_ /= sum_weights_;
 
     // communicate the value of the offset term to be added
@@ -327,7 +344,11 @@ class KullbackLeiblerDivergence : public Metric {
         }
       }
     }
-    double loss = presum_label_entropy_ + sum_loss / sum_weights_;
+    double global_sum_loss = sum_loss;
+    if (Network::num_machines() > 1) {
+      global_sum_loss = Network::GlobalSyncUpBySum(global_sum_loss);
+    }
+    double loss = presum_label_entropy_ + global_sum_loss / sum_weights_;
     return std::vector<double>(1, loss);
   }
 

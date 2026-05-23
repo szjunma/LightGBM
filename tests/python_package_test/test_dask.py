@@ -10,7 +10,7 @@ from sys import platform
 from urllib.parse import urlparse
 
 import pytest
-from sklearn.metrics import accuracy_score, r2_score
+from sklearn.metrics import accuracy_score, log_loss, r2_score
 
 import lightgbm as lgb
 
@@ -30,7 +30,7 @@ from dask.array.utils import assert_eq
 from dask.distributed import Client, LocalCluster, default_client, wait
 from scipy.sparse import csc_matrix, csr_matrix
 from scipy.stats import spearmanr
-from sklearn.datasets import make_blobs, make_regression
+from sklearn.datasets import make_blobs, make_classification, make_regression
 
 from .utils import make_ranking, pickle_obj, unpickle_obj
 
@@ -946,6 +946,366 @@ def test_eval_set_no_early_stopping(task, output, eval_sizes, eval_names_prefix,
                         assert metric in evals_result[eval_name]
                         assert metric in best_scores[eval_name]
                         assert len(evals_result[eval_name][metric]) == fit_trees
+
+
+def test_eval_set_binary_logloss_uses_all_distributed_validation_data(cluster):
+    X_train, y_train = make_classification(
+        n_samples=2000,
+        n_features=20,
+        n_informative=8,
+        n_redundant=2,
+        weights=[0.55, 0.45],
+        class_sep=1.0,
+        random_state=3,
+    )
+    X0, y0 = make_classification(
+        n_samples=500,
+        n_features=20,
+        n_informative=8,
+        n_redundant=2,
+        weights=[0.95, 0.05],
+        class_sep=0.5,
+        random_state=11,
+    )
+    X1, y1 = make_classification(
+        n_samples=500,
+        n_features=20,
+        n_informative=8,
+        n_redundant=2,
+        weights=[0.05, 0.95],
+        class_sep=2.0,
+        random_state=13,
+    )
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMClassifier(
+            client=client,
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)], eval_metric="binary_logloss")
+
+        proba = dask_model.predict_proba(dX_valid).compute()[:, 1]
+        expected_logloss = log_loss(y_valid, proba, labels=[0, 1])
+        reported_logloss = dask_model.evals_result_["valid_0"]["binary_logloss"][-1]
+        best_score_logloss = dask_model.booster_.best_score["valid_0"]["binary_logloss"]
+
+        np.testing.assert_allclose(reported_logloss, expected_logloss)
+        np.testing.assert_allclose(best_score_logloss, expected_logloss)
+
+
+def test_eval_set_regression_l2_uses_all_distributed_validation_data(cluster):
+    X_train, y_train = make_regression(
+        n_samples=2000,
+        n_features=20,
+        n_informative=8,
+        noise=0.5,
+        random_state=3,
+    )
+    X0, y0 = make_regression(
+        n_samples=500,
+        n_features=20,
+        n_informative=8,
+        noise=0.5,
+        random_state=11,
+    )
+    X1, y1 = make_regression(
+        n_samples=500,
+        n_features=20,
+        n_informative=8,
+        noise=0.5,
+        random_state=13,
+    )
+    y1 += 100.0
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMRegressor(
+            client=client,
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)], eval_metric="l2")
+
+        pred = dask_model.predict(dX_valid).compute()
+        expected_l2 = np.mean((y_valid - pred) ** 2)
+        reported_l2 = dask_model.evals_result_["valid_0"]["l2"][-1]
+        best_score_l2 = dask_model.booster_.best_score["valid_0"]["l2"]
+
+        np.testing.assert_allclose(reported_l2, expected_l2)
+        np.testing.assert_allclose(best_score_l2, expected_l2)
+
+
+def test_eval_set_regression_r2_uses_all_distributed_validation_data(cluster):
+    X_train, y_train = make_regression(
+        n_samples=2000,
+        n_features=20,
+        n_informative=8,
+        noise=0.5,
+        random_state=3,
+    )
+    X0, y0 = make_regression(
+        n_samples=500,
+        n_features=20,
+        n_informative=8,
+        noise=0.5,
+        random_state=11,
+    )
+    X1, y1 = make_regression(
+        n_samples=500,
+        n_features=20,
+        n_informative=8,
+        noise=0.5,
+        random_state=13,
+    )
+    y1 += 300.0
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMRegressor(
+            client=client,
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)], eval_metric="r2")
+
+        pred = dask_model.predict(dX_valid).compute()
+        expected_r2 = r2_score(y_valid, pred)
+        reported_r2 = dask_model.evals_result_["valid_0"]["r2"][-1]
+        best_score_r2 = dask_model.booster_.best_score["valid_0"]["r2"]
+
+        np.testing.assert_allclose(reported_r2, expected_r2)
+        np.testing.assert_allclose(best_score_r2, expected_r2)
+
+
+def test_eval_set_multiclass_logloss_uses_all_distributed_validation_data(cluster):
+    X_train, y_train = make_blobs(
+        n_samples=2000,
+        centers=[[-4, -4], [4, 4], [-4, 4]],
+        cluster_std=2.0,
+        random_state=3,
+    )
+    X0, y0 = make_blobs(
+        n_samples=[450, 25, 25],
+        centers=[[-4, -4], [4, 4], [-4, 4]],
+        cluster_std=3.0,
+        random_state=11,
+    )
+    X1, y1 = make_blobs(
+        n_samples=[25, 450, 25],
+        centers=[[-4, -4], [4, 4], [-4, 4]],
+        cluster_std=1.0,
+        random_state=13,
+    )
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMClassifier(
+            client=client,
+            objective="multiclass",
+            num_class=3,
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)], eval_metric="multi_logloss")
+
+        proba = dask_model.predict_proba(dX_valid).compute()
+        expected_logloss = log_loss(y_valid, proba, labels=[0, 1, 2])
+        reported_logloss = dask_model.evals_result_["valid_0"]["multi_logloss"][-1]
+        best_score_logloss = dask_model.booster_.best_score["valid_0"]["multi_logloss"]
+
+        np.testing.assert_allclose(reported_logloss, expected_logloss)
+        np.testing.assert_allclose(best_score_logloss, expected_logloss)
+
+
+def test_eval_set_cross_entropy_uses_all_distributed_validation_data(cluster):
+    rng = np.random.RandomState(42)
+    X_train = rng.normal(size=(2000, 20))
+    coef = rng.normal(size=20)
+    y_train = 1.0 / (1.0 + np.exp(-(X_train @ coef) / 5.0))
+
+    X0 = rng.normal(loc=-1.0, size=(500, 20))
+    y0 = 0.1 + 0.2 * rng.random_sample(500)
+    X1 = rng.normal(loc=1.0, size=(500, 20))
+    y1 = 0.7 + 0.2 * rng.random_sample(500)
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMRegressor(
+            client=client,
+            objective="cross_entropy",
+            metric="cross_entropy",
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)])
+
+        pred = dask_model.predict(dX_valid).compute()
+        pred = np.clip(pred, 1.0e-12, 1.0 - 1.0e-12)
+        expected_loss = -np.mean(y_valid * np.log(pred) + (1.0 - y_valid) * np.log(1.0 - pred))
+        reported_loss = dask_model.evals_result_["valid_0"]["cross_entropy"][-1]
+        best_score_loss = dask_model.booster_.best_score["valid_0"]["cross_entropy"]
+
+        np.testing.assert_allclose(reported_loss, expected_loss)
+        np.testing.assert_allclose(best_score_loss, expected_loss)
+
+
+def test_eval_set_kullback_leibler_uses_all_distributed_validation_data(cluster):
+    rng = np.random.RandomState(42)
+    X_train = rng.normal(size=(2000, 20))
+    coef = rng.normal(size=20)
+    y_train = 1.0 / (1.0 + np.exp(-(X_train @ coef) / 5.0))
+
+    X0 = rng.normal(loc=-1.0, size=(500, 20))
+    y0 = 0.1 + 0.2 * rng.random_sample(500)
+    X1 = rng.normal(loc=1.0, size=(500, 20))
+    y1 = 0.7 + 0.2 * rng.random_sample(500)
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMRegressor(
+            client=client,
+            objective="cross_entropy",
+            metric="kullback_leibler",
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)])
+
+        pred = dask_model.predict(dX_valid).compute()
+        pred = np.clip(pred, 1.0e-12, 1.0 - 1.0e-12)
+        cross_entropy = -np.mean(y_valid * np.log(pred) + (1.0 - y_valid) * np.log(1.0 - pred))
+        label_entropy = np.mean(y_valid * np.log(y_valid) + (1.0 - y_valid) * np.log(1.0 - y_valid))
+        expected_loss = cross_entropy + label_entropy
+        reported_loss = dask_model.evals_result_["valid_0"]["kullback_leibler"][-1]
+        best_score_loss = dask_model.booster_.best_score["valid_0"]["kullback_leibler"]
+
+        np.testing.assert_allclose(reported_loss, expected_loss)
+        np.testing.assert_allclose(best_score_loss, expected_loss)
+
+
+def test_eval_set_cross_entropy_lambda_uses_all_distributed_validation_data(cluster):
+    rng = np.random.RandomState(42)
+    X_train = rng.normal(size=(2000, 20))
+    coef = rng.normal(size=20)
+    y_train = 1.0 / (1.0 + np.exp(-(X_train @ coef) / 5.0))
+
+    X0 = rng.normal(loc=-1.0, size=(500, 20))
+    y0 = 0.1 + 0.2 * rng.random_sample(500)
+    X1 = rng.normal(loc=1.0, size=(500, 20))
+    y1 = 0.7 + 0.2 * rng.random_sample(500)
+    X_valid = np.vstack([X0, X1])
+    y_valid = np.concatenate([y0, y1])
+    with Client(cluster) as client:
+        dX = da.from_array(X_train, chunks=(1000, X_train.shape[1]))
+        dy = da.from_array(y_train, chunks=(1000,))
+        dX_valid = da.from_array(X_valid, chunks=(500, X_valid.shape[1]))
+        dy_valid = da.from_array(y_valid, chunks=(500,))
+
+        dask_model = lgb.DaskLGBMRegressor(
+            client=client,
+            objective="cross_entropy_lambda",
+            metric="cross_entropy_lambda",
+            n_estimators=12,
+            num_leaves=7,
+            min_child_samples=5,
+            learning_rate=0.1,
+            random_state=42,
+            deterministic=True,
+            force_col_wise=True,
+            time_out=10,
+            tree_learner="data",
+            verbosity=-1,
+        )
+        dask_model.fit(dX, dy, eval_set=[(dX_valid, dy_valid)])
+
+        hhat = dask_model.predict(dX_valid).compute()
+        pred = np.clip(1.0 - np.exp(-hhat), 1.0e-12, 1.0 - 1.0e-12)
+        expected_loss = -np.mean(y_valid * np.log(pred) + (1.0 - y_valid) * np.log(1.0 - pred))
+        reported_loss = dask_model.evals_result_["valid_0"]["cross_entropy_lambda"][-1]
+        best_score_loss = dask_model.booster_.best_score["valid_0"]["cross_entropy_lambda"]
+
+        np.testing.assert_allclose(reported_loss, expected_loss)
+        np.testing.assert_allclose(best_score_loss, expected_loss)
 
 
 @pytest.mark.parametrize("task", ["binary-classification", "regression", "ranking"])

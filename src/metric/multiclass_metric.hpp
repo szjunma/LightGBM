@@ -7,6 +7,7 @@
 #define LIGHTGBM_SRC_METRIC_MULTICLASS_METRIC_HPP_
 
 #include <LightGBM/metric.h>
+#include <LightGBM/network.h>
 #include <LightGBM/utils/log.h>
 
 #include <string>
@@ -115,7 +116,13 @@ class MulticlassMetric: public Metric {
         }
       }
     }
-    double loss = sum_loss / sum_weights_;
+    double global_sum_loss = sum_loss;
+    double global_sum_weights = sum_weights_;
+    if (Network::num_machines() > 1) {
+      global_sum_loss = Network::GlobalSyncUpBySum(global_sum_loss);
+      global_sum_weights = Network::GlobalSyncUpBySum(global_sum_weights);
+    }
+    double loss = global_sum_loss / global_sum_weights;
     return std::vector<double>(1, loss);
   }
 
