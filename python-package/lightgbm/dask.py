@@ -63,6 +63,30 @@ _DaskMatrixLike = Union[dask_Array, dask_DataFrame]
 _DaskVectorLike = Union[dask_Array, dask_Series]
 _DaskPart = Union[np.ndarray, pd_DataFrame, pd_Series, ss.spmatrix]
 
+_SUPPORTED_DISTRIBUTED_EVAL_METRICS = {
+    "binary_error",
+    "binary_logloss",
+    "cross_entropy",
+    "cross_entropy_lambda",
+    "fair",
+    "gamma",
+    "gamma_deviance",
+    "huber",
+    "kullback_leibler",
+    "l1",
+    "l2",
+    "mape",
+    "multi_error",
+    "multi_logloss",
+    "poisson",
+    "quantile",
+    "r2",
+    "regression",
+    "regression_l1",
+    "rmse",
+    "tweedie",
+}
+
 
 class _RemoteSocket:
     def acquire(self) -> int:
@@ -166,6 +190,75 @@ def _remove_list_padding(*args: Any) -> List[List[Any]]:
     return [[z for z in arg if z is not None] for arg in args]
 
 
+def _slice_first(data: _DaskPart) -> _DaskPart:
+    return data[:1]
+
+
+def _zeros_like(data: _DaskPart) -> _DaskPart:
+    sliced = _slice_first(data)
+    if isinstance(sliced, np.ndarray):
+        return np.zeros_like(sliced)
+    elif isinstance(sliced, (pd_DataFrame, pd_Series)):
+        return sliced * 0
+    else:
+        raise TypeError(f"Data must be one of: numpy arrays, pandas dataframes. Got {type(sliced).__name__}.")
+
+
+def _ones_like(data: _DaskPart) -> _DaskPart:
+    return _zeros_like(data) + 1
+
+
+def _has_custom_eval_metric(eval_metric: Optional[_LGBM_ScikitEvalMetricType]) -> bool:
+    if eval_metric is None:
+        return False
+    if callable(eval_metric):
+        return True
+    if isinstance(eval_metric, list):
+        return any(callable(metric) for metric in eval_metric)
+    return False
+
+
+def _is_no_metric(metric: Any) -> bool:
+    return isinstance(metric, str) and metric.lower() in {"", "na", "none", "null"}
+
+
+def _has_missing_eval_chunks(eval_set: List[Tuple[_DaskMatrixLike, _DaskCollection]], n_parts: int) -> bool:
+    return any(X_eval.npartitions < n_parts for X_eval, _ in eval_set)
+
+
+def _get_eval_metric_builtin_names(eval_metric: Optional[_LGBM_ScikitEvalMetricType]) -> List[str]:
+    if isinstance(eval_metric, str):
+        return [eval_metric]
+    if isinstance(eval_metric, list):
+        return [metric for metric in eval_metric if isinstance(metric, str)]
+    return []
+
+
+def _get_eval_metric_names(
+    params: Dict[str, Any], eval_metric: Optional[_LGBM_ScikitEvalMetricType], model_factory: Type[LGBMModel]
+) -> List[str]:
+    metric_names = []
+    metric_names.extend(_get_eval_metric_builtin_names(eval_metric))
+
+    param_metric = params.get("metric")
+    if isinstance(param_metric, str):
+        metric_names.append(param_metric)
+    elif isinstance(param_metric, list):
+        metric_names.extend(metric for metric in param_metric if isinstance(metric, str))
+    elif param_metric is None:
+        objective = params.get("objective")
+        if isinstance(objective, str):
+            metric_names.append(objective)
+        elif issubclass(model_factory, LGBMRegressor):
+            metric_names.append("l2")
+        elif issubclass(model_factory, LGBMClassifier):
+            metric_names.append("binary_logloss")
+        elif issubclass(model_factory, LGBMRanker):
+            metric_names.append("ndcg")
+
+    return [metric for metric in metric_names if not _is_no_metric(metric)]
+
+
 def _pad_eval_names(
     *,
     lgbm_model: LGBMModel,
@@ -195,6 +288,7 @@ def _train_part(
     return_model: bool,
     time_out: int,
     remote_socket: _RemoteSocket,
+    use_missing_eval_placeholders: bool,
     **kwargs: Any,
 ) -> Optional[LGBMModel]:
     network_params = {
@@ -242,15 +336,14 @@ def _train_part(
 
         local_eval_set = []
         evals_result_names = []
+        missing_eval_component_idx = []
+        has_missing_eval_component = False
         if has_eval_sample_weight:
             local_eval_sample_weight = []
         if has_eval_init_score:
             local_eval_init_score = []
         if is_ranker:
             local_eval_group = []
-
-        # store indices of eval_set components that were not contained within local parts.
-        missing_eval_component_idx = []
 
         # consolidate parts of each individual eval component.
         for i in range(n_evals):
@@ -306,16 +399,23 @@ def _train_part(
             x_e, y_e, w_e, init_score_e, g_e = _remove_list_padding(x_e, y_e, w_e, init_score_e, g_e)
             if x_e:
                 local_eval_set.append((_concat(x_e), _concat(y_e)))
+            elif use_missing_eval_placeholders:
+                local_eval_set.append((_slice_first(data), _slice_first(label)))
+                w_e = [_zeros_like(label)]
+                g_e = [_ones_like(label)]
+                has_missing_eval_component = True
+                if local_eval_sample_weight is None:
+                    local_eval_sample_weight = [None] * i
             else:
                 missing_eval_component_idx.append(i)
                 continue
 
-            if w_e:
-                local_eval_sample_weight.append(_concat(w_e))
-            if init_score_e:
-                local_eval_init_score.append(_concat(init_score_e))
-            if g_e:
-                local_eval_group.append(_concat(g_e))
+            if has_eval_sample_weight or has_missing_eval_component:
+                local_eval_sample_weight.append(_concat(w_e) if w_e else None)
+            if has_eval_init_score:
+                local_eval_init_score.append(_concat(init_score_e) if init_score_e else None)
+            if is_ranker:
+                local_eval_group.append(_concat(g_e) if g_e else None)
 
         # reconstruct eval_set fit args/kwargs depending on which components of eval_set are on worker.
         eval_component_idx = [i for i in range(n_evals) if i not in missing_eval_component_idx]
@@ -478,9 +578,10 @@ def _train(
         where the first 10 records are in the first group, records 11-30 are in the second group, records 31-70 are in the third group, etc.
     eval_set : list of (X, y) tuples of Dask data collections, or None, optional (default=None)
         List of (X, y) tuple pairs to use as validation sets.
-        Note, that not all workers may receive chunks of every eval set within ``eval_set``. When the returned
-        lightgbm estimator is not trained using any chunks of a particular eval set, its corresponding component
-        of ``evals_result_`` and ``best_score_`` will be empty dictionaries.
+        Note, that not all workers may receive chunks of every eval set within ``eval_set``. For supported
+        built-in metrics with additive components, workers without chunks of an eval set use a zero-weight
+        placeholder row, so globally aggregated metrics skip those workers' local contributions. This
+        placeholder path is not used for custom evaluation functions.
     eval_names : list of str, or None, optional (default=None)
         Unique identifiers for each evaluation dataset.
         Should be the same length as ``eval_set`` / ``eval_X``.
@@ -501,6 +602,11 @@ def _train(
         If callable, it should be a custom evaluation metric, see note below for more details.
         If list, it can be a list of built-in metrics, a list of custom evaluation metrics, or a mix of both.
         In either case, the ``metric`` from the Dask model parameters (or inferred from the objective) will be evaluated and used as well.
+        For Dask training, built-in validation metrics with additive components are aggregated across workers.
+        Metrics that require global ordering, pairwise comparisons, or query grouping, such as ``auc``,
+        ``average_precision``, ``auc_mu``, ``ndcg``, and ``map``, are not globally aggregated. Custom evaluation
+        functions may also be evaluated using worker-local validation data. These limitations affect
+        ``evals_result_``, ``best_score_``, and early stopping.
         Default: 'l2' for DaskLGBMRegressor, 'binary(multi)_logloss' for DaskLGBMClassifier, 'ndcg' for DaskLGBMRanker.
     eval_at : list or tuple of int, optional (default=None)
         The evaluation positions of the specified ranking metric.
@@ -598,12 +704,34 @@ def _train(
             parts[i]["init_score"] = init_score_parts[i]
 
     eval_set = _validate_eval_set_Xy(eval_set=eval_set, eval_X=eval_X, eval_y=eval_y)
+    use_missing_eval_placeholders = True
+    has_missing_eval_chunks = False
+    if eval_set:
+        has_missing_eval_chunks = _has_missing_eval_chunks(eval_set=eval_set, n_parts=n_parts)
+        has_custom_eval_metric = _has_custom_eval_metric(eval_metric)
+        eval_metric_builtin_names = _get_eval_metric_builtin_names(eval_metric)
+        metric_names = _get_eval_metric_names(params=params, eval_metric=eval_metric, model_factory=model_factory)
+        has_supported_eval_metric = any(metric in _SUPPORTED_DISTRIBUTED_EVAL_METRICS for metric in metric_names)
+        use_missing_eval_placeholders = has_missing_eval_chunks and has_supported_eval_metric
+        if (
+            has_missing_eval_chunks
+            and has_custom_eval_metric
+            and has_supported_eval_metric
+            and not eval_metric_builtin_names
+        ):
+            params["metric"] = "None"
+            use_missing_eval_placeholders = False
+        if has_missing_eval_chunks:
+            _log_warning(
+                "Worker with no local eval chunks was not allocated eval_set data. Therefore evals_result_ and best_score_ "
+                "data may be unreliable. Try rebalancing data across workers."
+            )
     # evals_set will to be re-constructed into smaller lists of (X, y) tuples, where
     # X and y are each delayed sub-lists of original eval dask Collections.
     if eval_set:
         # find maximum number of parts in an individual eval set so that we can
         # pad eval sets when they come in different sizes.
-        n_largest_eval_parts = max(x[0].npartitions for x in eval_set)
+        n_largest_eval_parts = max(n_parts, *(x[0].npartitions for x in eval_set))
 
         eval_sets: Dict[
             int, List[Union[_DatasetNames, Tuple[List[Optional[_DaskMatrixLike]], List[Optional[_DaskVectorLike]]]]]
@@ -729,22 +857,6 @@ def _train(
     for key, workers in who_has.items():
         worker_map[next(iter(workers))].append(key_to_part_dict[key])
 
-    # Check that all workers were provided some of eval_set. Otherwise warn user that validation
-    # data artifacts may not be populated depending on worker returning final estimator.
-    if eval_set:
-        for worker in worker_map:
-            has_eval_set = False
-            for part in worker_map[worker]:
-                if "eval_set" in part.result():  # type: ignore[attr-defined]
-                    has_eval_set = True
-                    break
-
-            if not has_eval_set:
-                _log_warning(
-                    f"Worker {worker} was not allocated eval_set data. Therefore evals_result_ and best_score_ data may be unreliable. "
-                    "Try rebalancing data across workers."
-                )
-
     # assign general validation set settings to fit kwargs.
     if eval_names:
         kwargs["eval_names"] = eval_names
@@ -829,6 +941,7 @@ def _train(
             time_out=params.get("time_out", 120),
             remote_socket=worker_to_socket_future.get(worker, None),
             return_model=(worker == master_worker),
+            use_missing_eval_placeholders=use_missing_eval_placeholders,
             workers=[worker],
             allow_other_workers=False,
             pure=False,
