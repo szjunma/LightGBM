@@ -32,13 +32,7 @@ import scipy.sparse
 from .compat import PANDAS_INSTALLED, concat, pd_CategoricalDtype, pd_DataFrame, pd_Series
 
 if TYPE_CHECKING:
-    from typing import Literal
-
-    # typing.TypeGuard was only introduced in Python 3.10
-    try:
-        from typing import TypeGuard
-    except ImportError:
-        from typing_extensions import TypeGuard
+    from typing import Literal, TypeGuard
 
 
 __all__ = [
@@ -3122,6 +3116,7 @@ class Dataset:
         if self._handle is not None and position is not None:
             position = _list_to_1d_numpy(data=position, dtype=np.int32, name="position")
             self.set_field("position", position)
+            self.position = self.get_field("position")  # original values can be modified at cpp side
         return self
 
     def get_feature_name(self) -> List[str]:
