@@ -75,9 +75,12 @@ _LGBM_GroupType = Union[
     pd_Series,
     nwt.IntoSeries,
 ]
+# 'position' intentionally does not support 'list' inputs
+# ref: https://github.com/lightgbm-org/LightGBM/pull/5929#discussion_r1262646998
 _LGBM_PositionType = Union[
     np.ndarray,
     pd_Series,
+    nwt.IntoSeries,
 ]
 _LGBM_InitScoreType = Union[
     List[float],
@@ -1752,7 +1755,7 @@ class Dataset:
             Other parameters for Dataset.
         free_raw_data : bool, optional (default=True)
             If True, raw data is freed after constructing inner Dataset.
-        position : numpy 1-D array, pandas Series or None, optional (default=None)
+        position : numpy 1-D array, pandas Series, pyarrow ChunkedArray, polars Series or None, optional (default=None)
             Position of items used in unbiased learning-to-rank task.
         """
         self._handle: Optional[_DatasetHandle] = None
@@ -2577,7 +2580,7 @@ class Dataset:
             Init score for Dataset.
         params : dict or None, optional (default=None)
             Other parameters for validation Dataset.
-        position : numpy 1-D array, pandas Series or None, optional (default=None)
+        position : numpy 1-D array, pandas Series, pyarrow ChunkedArray, polars Series or None, optional (default=None)
             Position of items used in unbiased learning-to-rank task.
 
         Returns
@@ -3102,7 +3105,7 @@ class Dataset:
 
         Parameters
         ----------
-        position : numpy 1-D array, pandas Series or None, optional (default=None)
+        position : numpy 1-D array, pandas Series, pyarrow ChunkedArray, polars Series or None, optional (default=None)
             Position of items used in unbiased learning-to-rank task.
 
         Returns
@@ -3112,7 +3115,8 @@ class Dataset:
         """
         self.position = position
         if self._handle is not None and position is not None:
-            position = _list_to_1d_numpy(data=position, dtype=np.int32, name="position")
+            if isinstance(position, pd_Series) or not nwd.is_into_series(position):
+                position = _list_to_1d_numpy(data=position, dtype=np.int32, name="position")
             self.set_field("position", position)
             self.position = self.get_field("position")  # original values can be modified at cpp side
         return self
@@ -3262,7 +3266,7 @@ class Dataset:
 
         Returns
         -------
-        position : numpy 1-D array, pandas Series or None
+        position : numpy 1-D array, pandas Series, pyarrow ChunkedArray, polars Series or None
             Position of items used in unbiased learning-to-rank task.
             For a constructed ``Dataset``, this will only return ``None`` or a numpy array.
         """
